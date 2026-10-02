@@ -1,5 +1,5 @@
 """
-Bot Scalping v22.1 — DYNAMIC LOGIC TOGGLE (NORMAL <-> INVERTED) — Binance Futures (PAPER)
+Bot Scalping v22.2 — DYNAMIC LOGIC TOGGLE (NORMAL <-> INVERTED) — Binance Futures (PAPER)
 =========================================================================================
 ATURAN:
 - Mode awal: NORMAL  (sinyal LONG -> eksekusi LONG, sinyal SHORT -> eksekusi SHORT)
@@ -7,6 +7,14 @@ ATURAN:
       NORMAL -> INVERTED   |   INVERTED -> NORMAL
 - Posisi tutup PROFIT (TP, atau TIME_LIMIT dengan PnL >= 0) -> mode TETAP
 - MAX_POSITIONS = 1, ORDER_USDT (margin) = 3.0 USDT, NO BAN, NO SIGNAL FLIP
+
+PERBAIKAN v22.2 (dibanding v22.1) — risk & kualitas entry, aturan toggle TIDAK berubah:
+ A. TP/SL diperkecil sesuai skala candle 5m (SL 0.7-1.1%, TP 1.0-1.6%), sebelumnya
+    SL 1.5-2.5% = ~30% margin hilang per SL dan TP hampir tidak pernah tersentuh.
+ B. MAX_HOLD 1 jam 42 menit -> 30 menit (sinyal 5m basi setelah itu; fee juga makan).
+ C. Sinyal harus FRESH: entry hanya dalam SIGNAL_MAX_AGE_SEC detik setelah candle tutup.
+ D. Anti-chasing: batal entry kalau harga live sudah lari > MAX_DRIFT_PCT dari close candle.
+ E. Satu simbol tidak boleh entry dua kali pada candle sinyal yang sama.
 
 PERBAIKAN v22.1 (dibanding v22.0):
  1. RACE CONDITION toggle: dulu slot dibebaskan SEBELUM mode di-toggle, sehingga scanner
@@ -115,14 +123,18 @@ SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
 # Dynamic Volatility Risk Management (ATR Multipliers)
-ATR_TP_RESTORED_MULTIPLIER = 3.5
-ATR_SL_RESTORED_MULTIPLIER = 1.8
+ATR_TP_RESTORED_MULTIPLIER = 2.5
+ATR_SL_RESTORED_MULTIPLIER = 1.5
 
-MIN_TP_PCT        = 0.025
-MAX_TP_PCT        = 0.035
-MIN_SL_PCT        = 0.015
-MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   # 1 jam 42 menit
+MIN_TP_PCT        = 0.010
+MAX_TP_PCT        = 0.016
+MIN_SL_PCT        = 0.007
+MAX_SL_PCT        = 0.011
+MAX_HOLD_SECONDS  = 1800   # 30 menit
+
+# Kualitas entry
+SIGNAL_MAX_AGE_SEC = 90     # entry hanya <= 90 detik setelah candle sinyal tutup
+MAX_DRIFT_PCT      = 0.004  # batal entry kalau harga sudah lari 0.4% dari close candle
 
 # Institutional Microstructure
 WALL_RATIO_THRESHOLD  = 2.5
@@ -657,6 +669,7 @@ MARKPRICE_FRESH_SEC = 10
 
 # Filter exchange per simbol: {"step": float, "min_qty": float, "min_notional": float}
 _sym_filters = {}
+_entered_candle = {}   # {symbol: candle_time} anti entry ganda di candle yang sama
 
 _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
@@ -983,6 +996,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     with _lock:
         live_positions[sym] = pos
+    if risk_profile and risk_profile.get("candle_time") is not None:
+        _entered_candle[sym] = risk_profile["candle_time"]
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     mode_str = "INVERTED" if inverted_now else "NORMAL"
@@ -1143,6 +1158,16 @@ def scan_one(sym):
         px_live = price_live(sym)
         if px_live == 0: return None
 
+        # Sinyal harus fresh & belum dipakai di candle yang sama
+        candle_time = int(df_ta["time"].iloc[-1])
+        candle_close_ts = float(df_ta["ct"].iloc[-1]) / 1000.0
+        if time.time() - candle_close_ts > SIGNAL_MAX_AGE_SEC:
+            return None
+        if _entered_candle.get(sym) == candle_time:
+            return None
+        if abs(px_live - px_candle) / px_candle > MAX_DRIFT_PCT:
+            return None
+
         # Lewati simbol yang tidak bisa dieksekusi dengan margin 3 USDT (tidak memblokir slot)
         if qty(sym, px_live) <= 0:
             return None
@@ -1168,6 +1193,7 @@ def scan_one(sym):
 
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
         risk_profile["scan_inverted"] = inv_snapshot
+        risk_profile["candle_time"] = candle_time
 
         return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
     except Exception as e:
@@ -1198,7 +1224,7 @@ def print_inline():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
-    print(f"       ┌ [PAPER ENGINE v22.1 - MODE: {mode_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U | Toggles:{_stats['toggles']}")
+    print(f"       ┌ [PAPER ENGINE v22.2 - MODE: {mode_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U | Toggles:{_stats['toggles']}")
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']}")
 
 def print_full():
@@ -1353,7 +1379,7 @@ def handle_depth_multiplex(msg):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.1 — DYNAMIC INVERT LOGIC ENGINE (PAPER)       ║")
+    print("║  💎 BOT SCALPING v22.2 — DYNAMIC INVERT LOGIC ENGINE (PAPER)       ║")
     print("║  1. Mode Awal: NORMAL (LONG->LONG, SHORT->SHORT)                   ║")
     print("║  2. Minus (SL / TimeLimit PnL<0) -> TOGGLE Normal <-> Inverted     ║")
     print("║  3. Profit (TP / TimeLimit PnL>=0) -> Mode TETAP                   ║")
