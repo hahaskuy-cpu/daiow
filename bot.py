@@ -1,5 +1,5 @@
 """
-Bot Scalping v22.2 — DYNAMIC LOGIC TOGGLE (NORMAL <-> INVERTED) — Binance Futures (PAPER)
+Bot Scalping v22.3 — DYNAMIC LOGIC TOGGLE (NORMAL <-> INVERTED) — Binance Futures (PAPER)
 =========================================================================================
 ATURAN:
 - Mode awal: NORMAL  (sinyal LONG -> eksekusi LONG, sinyal SHORT -> eksekusi SHORT)
@@ -7,6 +7,14 @@ ATURAN:
       NORMAL -> INVERTED   |   INVERTED -> NORMAL
 - Posisi tutup PROFIT (TP, atau TIME_LIMIT dengan PnL >= 0) -> mode TETAP
 - MAX_POSITIONS = 1, ORDER_USDT (margin) = 3.0 USDT, NO BAN, NO SIGNAL FLIP
+
+PERBAIKAN v22.3 (dibanding v22.2) — aturan toggle TIDAK berubah:
+ A. Riwayat 5 koin/trade terakhir ditampilkan lagi: setiap posisi tutup, di dashboard,
+    dan ringkasan satu baris di tiap siklus + info posisi yang sedang terbuka.
+ B. Filter volatilitas: skip koin dengan ATR < MIN_ATR_PCT. Koin "mati" tidak akan
+    mencapai TP, hanya berakhir TIME_LIMIT dan membayar fee (40% trade sebelumnya).
+ C. Pause kill-switch karena loss beruntun dinonaktifkan (tidak ada ban/pause; toggle
+    memang membuat loss beruntun sering terjadi). Kill-switch daily loss tetap ada.
 
 PERBAIKAN v22.2 (dibanding v22.1) — risk & kualitas entry, aturan toggle TIDAK berubah:
  A. TP/SL diperkecil sesuai skala candle 5m (SL 0.7-1.1%, TP 1.0-1.6%), sebelumnya
@@ -135,6 +143,7 @@ MAX_HOLD_SECONDS  = 1800   # 30 menit
 # Kualitas entry
 SIGNAL_MAX_AGE_SEC = 90     # entry hanya <= 90 detik setelah candle sinyal tutup
 MAX_DRIFT_PCT      = 0.004  # batal entry kalau harga sudah lari 0.4% dari close candle
+MIN_ATR_PCT        = 0.003  # skip koin dengan ATR(5m) < 0.3% harga (terlalu sepi untuk TP)
 
 # Institutional Microstructure
 WALL_RATIO_THRESHOLD  = 2.5
@@ -152,7 +161,7 @@ BTC_BREAKER_COOLDOWN = 120.0
 
 # Kill Switch
 DAILY_LOSS   = -20.0
-CONSEC_MAX   = 15
+CONSEC_MAX   = 10**9   # dinonaktifkan: tidak ada pause/ban karena loss beruntun
 CONSEC_PAUSE = 10
 
 # Learning
@@ -669,6 +678,7 @@ MARKPRICE_FRESH_SEC = 10
 
 # Filter exchange per simbol: {"step": float, "min_qty": float, "min_notional": float}
 _sym_filters = {}
+_recent_trades = deque(maxlen=5)   # riwayat 5 trade terakhir
 _entered_candle = {}   # {symbol: candle_time} anti entry ganda di candle yang sama
 
 _macro = {"btc": "UNKNOWN"}
@@ -677,7 +687,7 @@ _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0,
     "hard_sl": 0, "tp_exit": 0, "time_limit_exit": 0, "regime_block": 0,
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
-    "toggles": 0, "stale_mode_abort": 0,
+    "toggles": 0, "stale_mode_abort": 0, "low_vol_skip": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -1101,6 +1111,12 @@ def live_close(sym, reason, price=None):
         "mode": "INVERTED" if pos.get("inverted") else "NORMAL",
     })
 
+    _recent_trades.append({
+        "sym": sym, "side": side, "mode": "INVERTED" if pos.get("inverted") else "NORMAL",
+        "signal": pos.get("orig_signal", ""), "reason": reason,
+        "pct": pct, "pnl": pnl, "hold": int(hold),
+    })
+
     _hot_syms.appendleft(sym)
     _rescan_q.put(1)
     print_inline()
@@ -1146,6 +1162,9 @@ def scan_one(sym):
         df_ta = run_ta(df.copy())
         px_candle, atr_val = df_ta["close"].iloc[-1], df_ta["atr"].iloc[-1]
         if px_candle == 0 or np.isnan(atr_val): return None
+        if atr_val / px_candle < MIN_ATR_PCT:
+            _stats["low_vol_skip"] += 1
+            return None
 
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
@@ -1219,13 +1238,43 @@ def top_movers(syms, n=30):
     mv = [(s, abs(d["pct"])) for s, d in tk.items() if s in ss]
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
 
+def print_recent():
+    rt = list(_recent_trades)
+    print("       📜 5 TRADE TERAKHIR (terbaru di atas):")
+    if not rt:
+        print("          (belum ada trade)")
+        return
+    for i, t in enumerate(reversed(rt), 1):
+        icon = "🟢" if t["pnl"] >= 0 else "🔴"
+        print(f"          {i}. {icon} {t['sym']:<13} {t['side']:<5} [{t['mode'][:3]}] {t['reason']:<10} "
+              f"{t['pct']:+.2f}% PnL:{t['pnl']:+.4f}U hold:{t['hold']}s")
+
+def last5_line() -> str:
+    return " | ".join(
+        f"{t['sym'].replace('USDT','')} {t['side'][0]} {'✓' if t['pnl'] >= 0 else '✗'}{t['pnl']:+.2f}"
+        for t in reversed(_recent_trades)
+    )
+
+def open_pos_line() -> str:
+    parts = []
+    for sym, pos in list(live_positions.items()):
+        if pos.get("_r") or "entry" not in pos: continue
+        px = price_live(sym)
+        if px <= 0: continue
+        pct = ((px - pos["entry"]) / pos["entry"] * 100) if pos["side"] == "LONG" else ((pos["entry"] - px) / pos["entry"] * 100)
+        hold = time.time() - pos["open_time"]
+        parts.append(f"{sym} {pos['side']} [{'INV' if pos.get('inverted') else 'NOR'}] {pct:+.2f}% hold:{hold:.0f}s "
+                     f"(TP {pos['tp_pct']*100:.2f}% / SL {pos['sl_pct']*100:.2f}%)")
+    return " ; ".join(parts)
+
 def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
-    print(f"       ┌ [PAPER ENGINE v22.2 - MODE: {mode_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U | Toggles:{_stats['toggles']}")
+    print(f"       ┌ [PAPER ENGINE v22.3 - MODE: {mode_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U | Toggles:{_stats['toggles']}")
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']}")
+    print_recent()
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1236,7 +1285,8 @@ def print_full():
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD (MODE LOGIKA: {mode_str})")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} | Toggles:{_stats['toggles']}")
     print(f"    PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']}")
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']} | LowVolSkip:{_stats['low_vol_skip']}")
+    print_recent()
     print(f"  {'─'*72}")
 
 def t_monitor():
@@ -1379,7 +1429,7 @@ def handle_depth_multiplex(msg):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.2 — DYNAMIC INVERT LOGIC ENGINE (PAPER)       ║")
+    print("║  💎 BOT SCALPING v22.3 — DYNAMIC INVERT LOGIC ENGINE (PAPER)       ║")
     print("║  1. Mode Awal: NORMAL (LONG->LONG, SHORT->SHORT)                   ║")
     print("║  2. Minus (SL / TimeLimit PnL<0) -> TOGGLE Normal <-> Inverted     ║")
     print("║  3. Profit (TP / TimeLimit PnL>=0) -> Mode TETAP                   ║")
@@ -1423,8 +1473,12 @@ def run_bot():
         print(f"\n{'═'*68}")
         print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} Mode:[{mode_str}] ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
 
+        if _recent_trades: print(f"  📜 Last5: {last5_line()}")
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
-        elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
+        elif slots == 0:
+            print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
+            op = open_pos_line()
+            if op: print(f"  📌 Posisi: {op}")
         else: print(f"  🔍 Slot Kosong — Scanning Signal (Mode Active: {mode_str})...")
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
