@@ -89,7 +89,7 @@ twm = _create_twm()
 
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
-MAX_POSITIONS = 2
+MAX_POSITIONS = 1
 
 # ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
 SL_BAN_SECONDS = 3 * 60 * 60
